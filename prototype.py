@@ -238,7 +238,7 @@ def main(args, config):
         # 零样本 top-k 注释评估：零样本类内部 top-k，扫描 k=1..10
         utils.eval_zero_shot_topk(model, valid_loader, device, class_counts, prototypes=prototypes, model_type=2, max_k=10)
         # 门控分桶对比实验
-        utils.eval_count_bucket_comparison(model, valid_loader, device, prototypes, class_counts, model_type=2)
+        # utils.eval_count_bucket_comparison(model, valid_loader, device, prototypes, class_counts, model_type=2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Prototypical Network for Protein Function Prediction')

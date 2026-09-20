@@ -85,7 +85,7 @@ def main(args, config):
             # 此处计算仅决定加载前的模型结构与可学习参数初始值，不影响评估结果
             from custom import build_ancestor_prior
             _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
-            ancestor_mask, ic, alpha_lambda_init, ic_gamma_init = build_ancestor_prior(
+            ancestor_mask, ic, alpha_lambda_init, ic_gamma_init, smooth_tau_init = build_ancestor_prior(
                 datasets_path, namespace, dataset_name, _edges, train_seq_data,
                 class_counts, valid_mask, is_zero_shot)
             del _edges  # 立即释放 numpy 内存
@@ -93,7 +93,7 @@ def main(args, config):
                 input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes,
                 use_ancestor_weighting=True, ancestor_mask=ancestor_mask, ic=ic,
                 class_counts=class_counts, alpha_lambda_init=alpha_lambda_init,
-                ic_gamma_init=ic_gamma_init,
+                ic_gamma_init=ic_gamma_init, smooth_tau_init=smooth_tau_init,
             ).to(device)
         else:
             model = Model(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes,
@@ -132,14 +132,14 @@ def main(args, config):
         # 变量带 _mlp 后缀，避免覆盖本分支后续原型分析所需的 ic / hop_counts 等）
         if 'w_free' in mlp_state:
             from custom import build_ancestor_prior
-            ancestor_mask_mlp, ic_mlp, alpha_lambda_init_mlp, ic_gamma_init_mlp = build_ancestor_prior(
+            ancestor_mask_mlp, ic_mlp, alpha_lambda_init_mlp, ic_gamma_init_mlp, smooth_tau_init_mlp = build_ancestor_prior(
                 datasets_path, namespace, dataset_name, _edges, train_seq_data,
                 class_counts, valid_mask, is_zero_shot)
             mlp_model = CustomModel(
                 input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes,
                 use_ancestor_weighting=True, ancestor_mask=ancestor_mask_mlp, ic=ic_mlp,
                 class_counts=class_counts, alpha_lambda_init=alpha_lambda_init_mlp,
-                ic_gamma_init=ic_gamma_init_mlp,
+                ic_gamma_init=ic_gamma_init_mlp, smooth_tau_init=smooth_tau_init_mlp,
             ).to(device)
         else:
             mlp_model = CustomModel(input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes,
@@ -220,10 +220,10 @@ def main(args, config):
     if model_type == 1 and prototypes is not None:
 
         # τ_g 敏感性扫描
-        # utils.eval_tau_g_sensitivity(model, test_loader, device, prototypes, class_counts)
+        utils.eval_tau_g_sensitivity(model, test_loader, device, prototypes, class_counts)
 
         # 零样本类的祖先溯源（机制解释：原型如何从祖先借力）
-        # utils.eval_zero_shot_ancestry(model.proto_model, hop_counts, class_counts, go2id)
+        utils.eval_zero_shot_ancestry(model.proto_model, hop_counts, class_counts, go2id)
 
         # 可解释性: 层级违反率（MLP vs Proto vs 融合 的 true-path 违反占比）
         utils.eval_hier_violation_rate(model, test_loader, device, prototypes,

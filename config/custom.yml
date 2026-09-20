@@ -6,6 +6,6 @@ base_lr: 1e-3
 dataset: TALE
 datasets_path: './data_tale/'
 mode: test                    # [train/test]
-namespace: CC                 # [BP/CC/MF]
+namespace: BP                 # [BP/CC/MF]
 
 zero_shot: True

@@ -99,10 +99,11 @@ def build_ancestor_prior(datasets_path, namespace, dataset_name, edges,
     """构建祖先加权分类头所需的层级先验，复用 prototype.py 中的 hop_counts / ic 计算过程。
 
     Returns:
-        (ancestor_mask, ic, lambda_init, gamma_init):
+        (ancestor_mask, ic, lambda_init, gamma_init, tau_init):
         - ancestor_mask: (C, C) BoolTensor，mask[i][j]=True 表示 j 是 i 的祖先
         - ic: (C,) 各 GO term 的信息量
-        - lambda_init / gamma_init: α 权重中样本量敏感度 λ 与 IC 衰减速率 γ 的数据驱动初始值
+        - lambda_init / gamma_init / tau_init: α 权重中样本量敏感度 λ、IC 衰减速率 γ
+          与凸组合门控半饱和常数 τ 的数据驱动初始值
     """
     hop_counts = utils.get_ancestor_hop_matrix(edges)  # 每个节点到任意祖先节点的跳数
     if not is_zero_shot: hop_counts = hop_counts[valid_mask][:, valid_mask]
@@ -133,10 +134,10 @@ def build_ancestor_prior(datasets_path, namespace, dataset_name, edges,
             ic[idx] = -math.log(freq) if freq > 0 else 0.0
         ic = torch.from_numpy(ic).float()
         if not is_zero_shot: ic = ic[valid_mask]
-    # α 的可学习超参初始值由数据分布自动估计（与 prototype.py 一致，无需手工设置）
-    lambda_init, gamma_init, _ = utils.compute_smooth_param_inits(hop_counts, ic, class_counts)
-    print(f'祖先加权分类头可学习参数初始值(数据驱动): lambda={lambda_init:.4f}, gamma={gamma_init:.4f}')
-    return ancestor_mask, ic, lambda_init, gamma_init
+    # α / 门控的可学习超参初始值由数据分布自动估计（与 prototype.py 一致，无需手工设置）
+    lambda_init, gamma_init, tau_init = utils.compute_smooth_param_inits(hop_counts, ic, class_counts)
+    print(f'祖先加权分类头可学习参数初始值(数据驱动): lambda={lambda_init:.4f}, gamma={gamma_init:.4f}, tau={tau_init:.4f}')
+    return ancestor_mask, ic, lambda_init, gamma_init, tau_init
 
 def main(args, config):
     device = torch.device(args.device)
@@ -151,9 +152,10 @@ def main(args, config):
     esm_dim = config['esm_dim']
     hidden_dim = config['hidden_dim']
     is_zero_shot = config['zero_shot']
-    # 分类头配置: True 为"自由残差 + 祖先加权构造"（默认），False 为原始经典 MLP 分类头（消融基准）
+    # 分类头配置: True 为"凸组合门控 + 祖先加权构造"（默认），False 为原始经典 MLP 分类头（消融基准）
     use_ancestor_weighting = config.get('use_ancestor_weighting', True)
-    beta_init = float(config.get('beta_init', 0.5))
+    beta_init = float(config.get('beta_init', 0.9))   # 每类耦合系数 β_i 的统一初始值
+    tau_min = float(config.get('tau_min', 0.0))       # 可学习门控半饱和常数 τ 的下界（同 prototype）
     print('数据集:', dataset_name, 'namespace: ', namespace)
     num_classes =  np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_matrix_1_sparse.npy')).shape[0]
     features_path = os.path.join('/archive/hot5/fty/', dataset_name)
@@ -184,9 +186,9 @@ def main(args, config):
     child_indices = torch.from_numpy(_edges[:, 1].copy()).long().to(device)
 
     # ---- 祖先加权分类头：复用 prototype.py 的 hop_counts / ic 计算过程构建层级先验 ----
-    ancestor_mask, ic, alpha_lambda_init, ic_gamma_init = None, None, 10.0, 2.0
+    ancestor_mask, ic, alpha_lambda_init, ic_gamma_init, smooth_tau_init = None, None, 10.0, 2.0, 30.0
     if use_ancestor_weighting:
-        ancestor_mask, ic, alpha_lambda_init, ic_gamma_init = build_ancestor_prior(
+        ancestor_mask, ic, alpha_lambda_init, ic_gamma_init, smooth_tau_init = build_ancestor_prior(
             datasets_path, namespace, dataset_name, _edges, train_seq_data,
             class_counts, valid_mask, is_zero_shot)
     del _edges  # 立即释放 numpy 内存
@@ -196,11 +198,11 @@ def main(args, config):
         use_ancestor_weighting=use_ancestor_weighting,
         ancestor_mask=ancestor_mask, ic=ic, class_counts=class_counts,
         alpha_lambda_init=alpha_lambda_init, ic_gamma_init=ic_gamma_init,
-        beta_init=beta_init
+        beta_init=beta_init, smooth_tau_init=smooth_tau_init, tau_min=tau_min
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=base_lr * 0.01)
 
     # utils.print_loss_gradients(model, train_loader, parent_indices, child_indices, device)
     # hier_scale = utils.get_hier_scale(model, train_loader, parent_indices, child_indices, device) # 静态标定法缩放梯度
@@ -234,15 +236,15 @@ def main(args, config):
 
         # 训练
         train(model, optimizer, train_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices)
-        scheduler.step()
+        # scheduler.step()
 
         # 验证
         all_probs, all_labels = valid(model, valid_loader, epoch, device, scale, hier_reg_lambda, parent_indices, child_indices)
 
         # 打印祖先加权分类头可学习参数的当前实际值，观察学习进度
         if use_ancestor_weighting:
-            lam, gam, bet = model.get_ancestor_params()
-            print("ancestor head params: lambda: {:.4f}, gamma: {:.4f}, beta: {:.4f}".format(lam, gam, bet))
+            lam, gam, tau, bet = model.get_ancestor_params()
+            print("ancestor head params: lambda: {:.4f}, gamma: {:.4f}, tau: {:.4f}, beta(mean): {:.4f}".format(lam, gam, tau, bet))
 
     
     # utils.draw_frequencies_AUPRC(torch.cat(all_probs, dim=0).numpy(), torch.cat(all_probs_averge, dim=0).numpy(), torch.cat(all_labels, dim=0).numpy(), valid_freq, save_path=result_path, namespace=namespace) # 训练结束绘制结果曲线图
@@ -265,7 +267,7 @@ if __name__ == "__main__" :
     parser.add_argument('--config', type=str, default='./config/custom.yml', help='config yml')
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--batch_size', type=int, default=1024, help='batch size')
-    parser.add_argument('--epochs', type=int, default=50, help='epoch')
+    parser.add_argument('--epochs', type=int, default=100, help='epoch')
     parser.add_argument('--resume', type=str, nargs='?', const='auto', default=None,
                         help='断点恢复：指定 checkpoint 路径（仅保存模型权重）；或仅写 --resume（不带值）自动选择目录下最新 checkpoint')
     
