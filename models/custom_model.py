@@ -50,6 +50,11 @@ class Model(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self.use_ancestor_weighting = use_ancestor_weighting
+        # 有效分类头缓存（仅 eval 态使用，不进 state_dict）：推理期权重不变时，
+        # 凸组合与祖先混合矩阵乘（C²·D）一次算好复用，消除稳态推理的主要开销；
+        # 进入训练态或权重版本变化时自动失效重算
+        self._eff_cache = None
+        self._eff_cache_key = None
 
         self.proj = nn.Sequential(
             nn.LayerNorm(input_dim),
@@ -141,6 +146,16 @@ class Model(nn.Module):
         gate = torch.where(self.ancestor_mask.any(dim=1), gate, torch.zeros_like(gate))
         return gate
 
+    def _cache_key(self):
+        """缓存有效性键：相关可学习张量的版本号元组（任何 in-place 更新都会使其递增）。"""
+        return (self.w_free._version, self.b_free._version,
+                self.raw_beta._version, self.raw_tau._version,
+                self.raw_alpha_lambda._version, self.raw_ic_gamma._version)
+
+    def train(self, mode=True):
+        self._eff_cache = None   # 进入训练态即失效，确保梯度路径不受缓存影响
+        return super().train(mode)
+
     def _effective_classifier(self):
         """按"凸组合门控 + 祖先加权构造"计算有效分类头参数。
 
@@ -150,9 +165,16 @@ class Model(nn.Module):
         凸组合保证 w_i 始终落在自身与祖先自由参数之间，层级耦合强度不受自由分量范数增长稀释
         （这是相对加性残差 w_free + β·A 的关键改进）。
 
+        缓存：eval 态下权重不变，结果一次算好复用（以参数版本号为失效依据），
+        稳态推理不再重复祖先混合矩阵乘；训练态始终现算以保证梯度正确。
+
         Returns:
             (weight, bias): 有效分类头参数，形状 (num_classes, hidden_dim) 与 (num_classes,)
         """
+        if (not self.training and self._eff_cache is not None
+                and self._eff_cache_key == self._cache_key()):
+            return self._eff_cache
+
         alpha = self._compute_ancestor_alpha()                       # (C, C)
         alpha_sum = alpha.sum(dim=1, keepdim=True)                   # (C, 1)，根节点为 0
         alpha_norm = alpha / alpha_sum.clamp(min=1e-8)               # 行归一化 → 祖先加权平均
@@ -163,6 +185,9 @@ class Model(nn.Module):
         # weight 用 (C,1) 列向量广播、bias 用 (C,) 一维向量，避免 (C,1)+(C,) 混合广播
         weight = (1.0 - gate.unsqueeze(1)) * self.w_free + gate.unsqueeze(1) * a_weight  # (C, D)
         bias = (1.0 - gate) * self.b_free + gate * a_bias            # (C,)
+        if not self.training:
+            self._eff_cache = (weight, bias)
+            self._eff_cache_key = self._cache_key()
         return weight, bias
 
     def get_ancestor_params(self):

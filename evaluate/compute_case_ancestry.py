@@ -29,7 +29,7 @@ CKPT = '/archive/hot5/fty/checkpoints/{NS}/TALE/prototype/checkpoint_55.pth'
 
 
 def main():
-    from models.test_model import PrototypeNet
+    from models.prototype_model import PrototypeNet
 
     for ns, go in CASES:
         dp = './data_tale/TALE'

@@ -212,10 +212,24 @@ def main(args, config):
     # =========================================================
 
     # 零样本 top-k 注释评估（TALE 原文 Supp. Tables S18/S23/S28 协议，零样本类内 top-k）
-    utils.eval_zero_shot_topk(model, test_loader, device, class_counts, prototypes, model_type, max_k=10)
+    # --only_topk（bootstrap 统计实验专用）时额外把零样本概率矩阵落盘，供
+    # evaluate/zero_shot_topk_stats.py 离线计算置信区间与显著性检验；
+    # 默认 save_path=None，评估行为与原实现完全一致
+    topk_save_path = None
+    if getattr(args, 'only_topk', False):
+        topk_save_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tmp',
+            f'topk_probs_{dataset_name}_{namespace}_mt{model_type}.npz')
+    utils.eval_zero_shot_topk(model, test_loader, device, class_counts, prototypes,
+                              model_type, max_k=10, save_path=topk_save_path)
+    if getattr(args, 'only_topk', False):
+        return  # 仅需零样本 top-k 概率矩阵，跳过其余分析
 
     # 按训练正样本数分桶
     utils.eval_count_bucket_comparison(model, test_loader, device, prototypes, class_counts, model_type=model_type)
+
+    # 门控分布分析：凸组合祖先加权头 γ_i=β_i·τ/(n_i+τ) 的学习结果（仅新版头有效，其余自动跳过）
+    utils.eval_gate_distribution(model, class_counts, model_type=model_type)
 
     if model_type == 1 and prototypes is not None:
 
@@ -226,8 +240,7 @@ def main(args, config):
         utils.eval_zero_shot_ancestry(model.proto_model, hop_counts, class_counts, go2id)
 
         # 可解释性: 层级违反率（MLP vs Proto vs 融合 的 true-path 违反占比）
-        utils.eval_hier_violation_rate(model, test_loader, device, prototypes,
-                                       class_counts, hop_counts, model_type=1, eps=1e-4)
+        utils.eval_hier_violation_rate(model, test_loader, device, prototypes, class_counts, hop_counts, model_type=1, eps=1e-4)
         
         # 可解释性: 零样本案例研究（Proto 从祖先借力 → 命中 MLP 盲区的完整证据链）
         case_records = utils.eval_zero_shot_case_study(model, test_loader, device, prototypes, class_counts, hop_counts, go2id, n_cases=3, top_anc=3, test_seq_data=test_seq_data, protein_id_key='ac')
@@ -305,6 +318,9 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda', help='device id')
     parser.add_argument('--config', type=str, default='./config/eval.yml', help='config yml')
     parser.add_argument('--batch_size', type=int, default=512, help='batch size')
+    parser.add_argument('--only_topk', action='store_true',
+                        help='仅运行零样本 top-k 评估并将零样本概率矩阵落盘（bootstrap 统计实验用），'
+                             '跳过分桶/门控/案例等其余分析；默认关闭，关闭时流程与原实现一致')
 
     args = parser.parse_args()
 

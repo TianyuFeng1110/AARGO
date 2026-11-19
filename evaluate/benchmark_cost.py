@@ -9,7 +9,7 @@
   - 峰值显存 (GB):     torch.cuda.max_memory_allocated（含训练所需激活/梯度）
   - proteins/step:     每步实际流过编码器的蛋白数（两种采样方式的等效换算单位）
 
-显存与时间对比使用两种管线各自的"标准训练步"（MLP: bs=1024 随机采样；
+显存与时间对比使用两种管线各自的"标准训练步"（MLP: bs=8 随机采样；
 Proto: n_way=32 × (n_query=10+n_support=50) 情景采样），并报告 proteins/step
 以便换算为"每万蛋白的秒数"这一公平单位。
 
@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import utils as utils
 from models.custom_model import Model as MLPModel
-from models.test_model import PrototypeNet
+from models.prototype_model import PrototypeNet
 from datasets.dataset import Dataset
 from datasets.balanced_dataset import Dataset as BalancedDataset
 from datasets.collator import collator
@@ -61,36 +61,36 @@ def count_params_m(model):
 # ============================================================
 
 def measure_flops_per_sample(model, branch, esm_dim, num_classes, hidden_dim, device):
-    """单蛋白一次前向的 FLOPs。
+    """单蛋白一次前向的 FLOPs（解析式，Linear 按 2×MAC，覆盖全模型含分类头）。
 
-    MLP 分支:  encoder + classifier 复杂度 O(esm*hidden + hidden^2 + hidden*C)
-    Proto 分支: encoder 复杂度 O(esm*hidden + hidden^2) + predict 复杂度 O(hidden*C)
-    均可用 thop 直接 profile；thop 缺失时用解析式估算（数量级一致）。
+    此前用 thop 直接 profile，但 thop 只挂钩 nn.Module：函数式 F.linear 与
+    祖先混合的裸矩阵乘会被漏计；且 MZSGO / STAR-GO 两个基线的现有结果均为
+    解析式 2×MAC 口径（flops_method 列记录），故统一改用解析式保证三表可比。
+
+    各部分计法（LayerNorm / GELU / Dropout 等逐元素开销不计，与基线口径一致）：
+      - encoder:          两分支结构不同，分别按各自三层 Linear 计乘加数 ×2
+          MLP:   esm·hidden + hidden·2hidden + 2hidden·hidden
+          Proto: esm·hidden + hidden·hidden + hidden·hidden
+      - MLP 经典头:       2×hidden·C（nn.Linear）
+      - MLP 祖先加权头:   2×C·D（F.linear 打分，等价 nn.Linear）
+                        + 2×C²·(D+1)（祖先混合矩阵乘 α̂@W_free 与 α̂@b_free；
+                        凸组合构造每次前向都需重算祖先混合，是大本体推理开销的主要来源）
+      - Proto:            2×hidden·C（predict 的余弦相似度 q@p.T；
+                        原型为预计算量，平滑开销不摊入单样本前向）
     """
-    try:
-        from thop import profile
-        if branch == 'MLP':
-            dummy = torch.randn(1, esm_dim).to(device)
-            model.eval()
-            flops, _ = profile(model, inputs=(dummy,
-                                              torch.zeros(1, dtype=torch.long).to(device),
-                                              torch.zeros(1, num_classes).to(device)),
-                               verbose=False)
+    flops_method = 'analytic(全模型解析式, Linear 按 2×MAC)'
+    if branch == 'MLP':
+        enc = 2 * (esm_dim * hidden_dim + hidden_dim * (hidden_dim * 2)
+                   + (hidden_dim * 2) * hidden_dim)
+        if getattr(model, 'use_ancestor_weighting', False):
+            head = 2 * (num_classes * hidden_dim
+                        + num_classes * num_classes * (hidden_dim + 1))
         else:
-            dummy = torch.randn(1, esm_dim).to(device)
-            # _get_prototypes 返回 (num_classes, hidden_dim)，predict 中做 q @ p.T
-            protos = torch.randn(num_classes, hidden_dim).to(device)
-            model.eval()
-            flops, _ = profile(model, inputs=(dummy,
-                                              torch.zeros(1, num_classes).to(device),
-                                              None, None, protos),
-                               verbose=False)
-        return flops / 1e6
-    except ImportError:
-        # 解析估算: encoder(2层Linear+GELU) + head
-        enc = 2 * (esm_dim * hidden_dim + hidden_dim * hidden_dim)
-        head = hidden_dim * num_classes * (2 if branch == 'MLP' else 1)
-        return (enc + head) / 1e6
+            head = 2 * hidden_dim * num_classes
+    else:
+        enc = 2 * (esm_dim * hidden_dim + 2 * hidden_dim * hidden_dim)
+        head = 2 * hidden_dim * num_classes
+    return (enc + head) / 1e6, flops_method
 
 
 # ============================================================
@@ -229,8 +229,27 @@ def run_branch_benchmark(dataset_name, namespace, branch, args, device, rows):
 
     # ---- 模型与优化器 ----
     if branch == 'MLP':
-        model = MLPModel(input_dim=esm_dim, hidden_dim=hidden_dim,
-                         num_classes=num_classes).to(device)
+        # 新版"凸组合门控 + 祖先加权构造"分类头：复用 custom.py 的层级先验构建流程
+        # （与训练入口 custom.py 保持一致；配置 use_ancestor_weighting=False 可退回经典 MLP 头）
+        from custom import build_ancestor_prior
+        use_ancestor_weighting = cfg.get('use_ancestor_weighting', True)
+        if use_ancestor_weighting:
+            _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
+            ancestor_mask, ic_mlp, lam_mlp, gam_mlp, tau_mlp = build_ancestor_prior(
+                datasets_path, namespace, dataset_name, _edges, train_seq_data,
+                class_counts, valid_mask, is_zero_shot)
+            del _edges  # 立即释放 numpy 内存
+            model = MLPModel(
+                input_dim=esm_dim, hidden_dim=hidden_dim, num_classes=num_classes,
+                use_ancestor_weighting=True, ancestor_mask=ancestor_mask, ic=ic_mlp,
+                class_counts=class_counts, alpha_lambda_init=lam_mlp,
+                ic_gamma_init=gam_mlp, smooth_tau_init=tau_mlp,
+                beta_init=float(cfg.get('beta_init', 0.9)),
+                tau_min=float(cfg.get('tau_min', 0.0))).to(device)
+        else:
+            model = MLPModel(input_dim=esm_dim, hidden_dim=hidden_dim,
+                             num_classes=num_classes,
+                             use_ancestor_weighting=False).to(device)
     else:
         _edges = np.load(os.path.join(datasets_path, f'{namespace.lower()}_label_regular_1.npy'))
         hop_counts = utils.get_ancestor_hop_matrix(_edges)
@@ -257,7 +276,7 @@ def run_branch_benchmark(dataset_name, namespace, branch, args, device, rows):
 
     # ---- Params / FLOPs ----
     params_m = count_params_m(model)
-    flops_m = measure_flops_per_sample(model, branch, esm_dim, num_classes, hidden_dim, device)
+    flops_m, flops_method = measure_flops_per_sample(model, branch, esm_dim, num_classes, hidden_dim, device)
 
     # ---- DataLoader（各自采样方式） ----
     if branch == 'MLP':
@@ -291,6 +310,7 @@ def run_branch_benchmark(dataset_name, namespace, branch, args, device, rows):
         'num_classes': num_classes,
         'params_M': round(params_m, 3),
         'flops_per_sample_M': round(flops_m, 2),
+        'flops_method': flops_method,
         'steps_per_epoch': steps_per_epoch,
         'proteins_per_step': round(proteins_per_step, 1),
         'sec_per_step': round(sec_per_step, 4),
@@ -310,9 +330,9 @@ def run_branch_benchmark(dataset_name, namespace, branch, args, device, rows):
 
 def print_and_save(rows, args):
     cols = ['dataset', 'namespace', 'branch', 'num_classes', 'params_M',
-            'flops_per_sample_M', 'steps_per_epoch', 'proteins_per_step',
-            'sec_per_step', 'sec_per_10k_proteins', 'epochs', 'train_GPU_h',
-            'peak_mem_GB']
+            'flops_per_sample_M', 'flops_method', 'steps_per_epoch',
+            'proteins_per_step', 'sec_per_step', 'sec_per_10k_proteins',
+            'epochs', 'train_GPU_h', 'peak_mem_GB']
     w = max(len(c) for c in cols)
     print('\n' + '=' * (w * len(cols) // 2))
     print('效率基准测试结果')

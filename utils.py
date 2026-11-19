@@ -1784,7 +1784,7 @@ def eval_zero_shot_classes(model, test_loader, device, class_counts,
 
 
 def eval_zero_shot_topk(model, test_loader, device, class_counts,
-                        prototypes=None, model_type=None, max_k=10):
+                        prototypes=None, model_type=None, max_k=10, save_path=None):
     """零样本 top-k 注释评估（TALE 原文 Supp. Tables S18/S23/S28 协议）。
 
     对训练正样本数为 0 的 GO term (f(i)=0)，为每个测试蛋白在**零样本类内部**
@@ -1803,6 +1803,10 @@ def eval_zero_shot_topk(model, test_loader, device, class_counts,
         prototypes:   预计算原型（model_type 1/2 必需）
         model_type:   0=MLP, 1=门控融合, 2=原型网络
         max_k:        扫描的 top-k 上限（默认 10）
+        save_path:    可选；给定则把零样本类上的概率/标签矩阵落盘（.npz），
+                      供 eval_zero_shot_topk_bootstrap_stats 离线做 bootstrap
+                      置信区间与显著性检验。仅保存下方已计算好的中间量，
+                      不参与、不影响任何指标计算；默认 None 时与原实现完全一致。
     Returns:
         dict: {k: {'Fmax': float, 'micro_AUPRC': float}}
     """
@@ -1856,6 +1860,18 @@ def eval_zero_shot_topk(model, test_loader, device, class_counts,
     print(f"  测试集零样本正样本: {n_test_pos} "
           f"(覆盖 {int((zs_labels.sum(axis=0) > 0).sum())} 个零样本类)")
 
+    # 可选落盘（仅保存上方已算好的矩阵，不参与任何指标计算；save_path=None 时跳过）
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        np.savez_compressed(
+            save_path,
+            probs=zs_probs.astype(np.float32),   # (N_test, n_zs) 零样本类列预测概率
+            labels=zs_labels.astype(np.int8),    # (N_test, n_zs) 零样本类列真实标签
+            zs_cols=zs_cols,                     # 零样本类在完整类别空间的列索引
+            class_counts=counts_np,              # 各类训练正样本数（与入参一致）
+        )
+        print(f"  零样本概率/标签矩阵已保存至 {save_path}")
+
     # 3. 扫描 k：零样本类内取 top-k，构建二值预测矩阵后计算 Fmax
     print(f"  {'k':>3} | {'Fmax':>8} | {'micro_AUPRC':>11}")
     print(f"  {'-' * 30}")
@@ -1878,6 +1894,133 @@ def eval_zero_shot_topk(model, test_loader, device, class_counts,
         print(f"  → k≤{min(max_k, n_zs)} 内 Fmax 均未超过 0.1")
     print("=" * 70)
 
+    return results
+
+
+def eval_zero_shot_topk_bootstrap_stats(zs_probs, zs_labels, max_k=10,
+                                        baseline_fmax=None, baseline_auprc=None,
+                                        n_boot=1000, ci_level=95, seed=42):
+    """零样本 top-k 的 bootstrap 置信区间与显著性检验（可复用统计方法，纯 CPU）。
+
+    以「测试蛋白」为重采样单元（与 CAFA 官方评估的 target bootstrap 口径一致，
+    直接回应"个别测试蛋白即可翻转方法间排序"的小样本关切）：在零样本评估
+    population（至少含一个零样本真值标签的测试蛋白，与 calculate_metrics 的
+    蛋白筛选一致）上**有放回**重采样 n_eval 个蛋白共 n_boot 次，每次用同一批
+    重采样索引同时重算各 k 的 top-k Fmax 与 micro_AUPRC，得到：
+
+      - 每个 k 下 Fmax / micro_AUPRC 的 percentile 置信区间（默认 95%）；
+      - 相对最强基线汇总数字（常数，如已发表/复现报告的 MZSGO 值）的
+        双向单侧 bootstrap p 值（按 (B+1) 平滑避免 p=0）：
+          p_sup = (1 + #{Fmax*_b <= base}) / (B+1)   （小 => 证据支持"优于基线"）
+          p_inf = (1 + #{Fmax*_b >= base}) / (B+1)   （小 => 证据支持"劣于基线"）
+        两者均不小时即"与基线无显著差异（持平）"；
+      - P(Fmax*_b >= base)："超越或持平"的经验证据强度。
+
+    指标口径与 eval_zero_shot_topk / calculate_metrics 逐位一致：
+      - 先过滤"零样本真值全为 0"的蛋白（calculate_metrics 内部行为）；
+      - top-k 二值预测对 calculate_metrics 的阈值扫描不敏感，Fmax 有闭式
+        P = mean_i(tp_i)/k，R = mean_i(tp_i/tpfn_i)，Fmax = 2PR/(P+R)；
+        本方法在每个 k 的点估计上与 calculate_metrics 断言核对；
+      - micro_AUPRC 直接调用本模块的 auprc（sklearn precision_recall_curve +
+        auc），与 calculate_metrics 报告值同源。
+
+    Args:
+        zs_probs:  (N, C_zs) 零样本类上的预测概率矩阵（numpy）
+        zs_labels: (N, C_zs) 对应二值标签矩阵（numpy）
+        max_k:         扫描的 top-k 上限（与 eval_zero_shot_topk 的 max_k 对齐，默认 10）
+        baseline_fmax:  标量或长度 >= 实际 k 上限的序列（各 k 的基线 Fmax）；None 则只出 CI
+        baseline_auprc: 同上，各 k 的基线 micro_AUPRC
+        n_boot:    bootstrap 重采样次数（默认 1000）
+        ci_level:  置信水平百分数（默认 95 -> 2.5/97.5 分位）
+        seed:      随机种子（固定以保证可复现；同一份索引同时用于两个指标）
+    Returns:
+        dict: {
+          'meta': {'n_test_proteins', 'n_eval_proteins', 'n_zs_classes',
+                   'n_positives', 'n_boot', 'seed', 'ci_level'},
+          'k': {k: {'Fmax', 'Fmax_ci', 'Fmax_p_sup', 'Fmax_p_inf', 'Fmax_p_ge_base',
+                    'micro_AUPRC', 'AUPRC_ci', 'AUPRC_p_sup', 'AUPRC_p_inf',
+                    'AUPRC_p_ge_base'}}  （基线为 None 时 p_* 为 None）
+        }
+    """
+    zs_probs = np.asarray(zs_probs, dtype=np.float64)
+    zs_labels = np.asarray(zs_labels)
+    keep = zs_labels.sum(axis=1) > 0                     # calculate_metrics 的蛋白筛选口径
+    y = zs_labels[keep].astype(np.int64)                 # (n, C_zs)
+    p = zs_probs[keep]
+    n_eval, c_zs = y.shape
+    k_max = int(min(max_k, c_zs))
+    tpfn = y.sum(axis=1).astype(np.float64)              # (n,) 每蛋白零样本真值数
+
+    def _per_k_baseline(base, name):
+        if base is None:
+            return {}
+        if np.isscalar(base):
+            return {k: float(base) for k in range(1, k_max + 1)}
+        seq = list(base)
+        if len(seq) < k_max:
+            raise ValueError(f"{name} 基线序列长度 {len(seq)} < k 上限 {k_max}")
+        return {k: float(seq[k - 1]) for k in range(1, k_max + 1)}
+
+    base_f = _per_k_baseline(baseline_fmax, 'baseline_fmax')
+    base_a = _per_k_baseline(baseline_auprc, 'baseline_auprc')
+
+    # 预计算各 k 的二值 top-k 预测与逐蛋白命中数（行内排序与重采样无关，只需算一次）
+    topk_idx = np.argsort(-p, axis=1)[:, :k_max]         # 与 eval_zero_shot_topk 同序
+    rng = np.random.default_rng(seed)
+    idx_all = rng.integers(0, n_eval, size=(n_boot, n_eval))   # (B, n) 配对索引
+    lo_q, hi_q = (100 - ci_level) / 2.0, 100 - (100 - ci_level) / 2.0
+
+    results = {'meta': {'n_test_proteins': int(zs_labels.shape[0]),
+                        'n_eval_proteins': int(n_eval),
+                        'n_zs_classes': int(c_zs),
+                        'n_positives': int(zs_labels[keep].sum()),
+                        'n_boot': int(n_boot), 'seed': int(seed),
+                        'ci_level': int(ci_level)},
+               'k': {}}
+    print(f"[bootstrap] 评估蛋白 n={n_eval}（总测试 {results['meta']['n_test_proteins']}），"
+          f"零样本类 {c_zs}，正标注 {results['meta']['n_positives']}，B={n_boot}, seed={seed}")
+
+    for k in range(1, k_max + 1):
+        preds = np.zeros(y.shape, dtype=np.float64)
+        preds[np.arange(n_eval)[:, None], topk_idx[:, :k]] = 1.0
+        tp = (preds * y).sum(axis=1)                     # (n,) 每蛋白命中数
+
+        # ---- 点估计（闭式 Fmax，与 calculate_metrics 断言核对；AUPRC 走同源 auprc）----
+        prec = tp.mean() / k
+        rec = (tp / np.maximum(tpfn, 1.0)).mean()
+        fmax_pt = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        fmax_ref = calculate_metrics(zs_labels[keep], preds)['Fmax']
+        assert abs(fmax_ref - fmax_pt) < 1e-9, \
+            f"top-{k} Fmax 闭式与 calculate_metrics 不一致: {fmax_ref} vs {fmax_pt}"
+        auprc_pt = auprc(y.ravel(), preds.ravel())
+
+        # ---- bootstrap 分布（同一份重采样索引 => 两指标天然配对）----
+        tp_b, tpfn_b = tp[idx_all], tpfn[idx_all]        # (B, n)
+        prec_b = tp_b.mean(axis=1) / k
+        rec_b = (tp_b / np.maximum(tpfn_b, 1.0)).mean(axis=1)
+        denom_b = prec_b + rec_b
+        fmax_b = np.where(denom_b > 0, 2 * prec_b * rec_b / np.maximum(denom_b, 1e-300), 0.0)
+        auprc_b = np.empty(n_boot)
+        for b in range(n_boot):
+            i = idx_all[b]
+            auprc_b[b] = auprc(y[i].ravel(), preds[i].ravel())
+
+        entry = {'Fmax': float(fmax_pt),
+                 'Fmax_ci': [float(np.percentile(fmax_b, lo_q)), float(np.percentile(fmax_b, hi_q))],
+                 'micro_AUPRC': float(auprc_pt),
+                 'AUPRC_ci': [float(np.percentile(auprc_b, lo_q)), float(np.percentile(auprc_b, hi_q))]}
+        for tag, dist, base in (('Fmax', fmax_b, base_f.get(k)),
+                                ('AUPRC', auprc_b, base_a.get(k))):
+            if base is None:
+                entry[f'{tag}_p_sup'] = entry[f'{tag}_p_inf'] = entry[f'{tag}_p_ge_base'] = None
+            else:
+                entry[f'{tag}_p_sup'] = (1 + int((dist <= base).sum())) / (n_boot + 1)
+                entry[f'{tag}_p_inf'] = (1 + int((dist >= base).sum())) / (n_boot + 1)
+                entry[f'{tag}_p_ge_base'] = float((dist >= base).mean())
+        results['k'][k] = entry
+        print(f"  top-{k:>2}: Fmax={fmax_pt:.4f} [{entry['Fmax_ci'][0]:.4f}, {entry['Fmax_ci'][1]:.4f}]"
+              + (f"  base={base_f[k]:.4f}  p_sup={entry['Fmax_p_sup']:.4f} p_inf={entry['Fmax_p_inf']:.4f}"
+                 if k in base_f else ""))
     return results
 
 
@@ -3597,5 +3740,120 @@ def eval_prototype_knn_purity(prototypes_stable, prototypes_mean, hop_counts,
             val = float(purity[m].mean())
             results[f'{tag}_bin_{name}'] = val
             print(f"    {name:>5} (n={m.sum():>5}): purity = {val:.4f}")
+
+    return results
+
+
+# ============================================================
+#  实验：凸组合门控分布分析（新MLP分类头可解释性）
+# ============================================================
+
+def eval_gate_distribution(model, class_counts, model_type=None):
+    """门控分布分析：读取凸组合祖先加权分类头学到的每类门控，统计
+    祖先依赖度 γ_i = β_i·τ/(n_i+τ) 与训练正样本数 n_i 的关系。
+
+    γ_i 的直接语义是"类别 i 对祖先的依赖程度"：常见类 (n_i 大) γ_i→0，
+    保留自身自由分量；罕见类 (n_i→0) γ_i→β_i，趋向祖先加权平均。
+    其中 β_i = sigmoid(raw_beta_i) 为每类可学习耦合系数，
+    τ = tau_min + softplus(raw_tau) 为可学习半饱和常数。
+    若训练后呈现"罕见类维持高 γ、常见类压低 β/γ"，说明门控按样本可靠性
+    自适应分工——这是每类决策构成可读出的直接可解释证据。
+
+    统计内容:
+      1. 可学习半饱和常数 τ 与每类耦合系数 β_i 的全局统计
+      2. 按训练正样本数分箱的 β/γ 均值，并以"构造先验" τ/(n+τ)
+         （即 β≡1 时 γ 的结构参考线）对照
+      3. β_i / γ_i 与 n_i 的 Spearman 秩相关
+         （β 与 n 负相关→常见类被主动降低耦合，模型在学习分工）
+
+    Args:
+        model:        待分析模型。model_type=0 时为 CustomModel 本身；
+                      model_type=1 时为融合模型（自动取其 mlp_model 子头）
+        class_counts: Tensor (C,)，各类训练正样本数
+        model_type:   0=纯MLP, 1=门控融合；其余（如纯原型网络）无该分类头，打印跳过
+
+    Returns:
+        dict: {'tau': float, 'beta': Tensor(C,), 'gamma': Tensor(C,),
+               'class_counts': Tensor(C,)}，供绘图脚本复用；无可分析头时返回 None
+    """
+    # 1. 定位分类头并检查可分析性
+    if model_type == 1 and hasattr(model, 'mlp_model'):
+        head, desc = model.mlp_model, '门控融合中的MLP分类头'
+    else:
+        head, desc = model, '纯MLP分类头'
+    if not (hasattr(head, 'raw_beta') and hasattr(head, 'raw_tau') and hasattr(head, 'tau_min')):
+        print("[门控分布分析] 当前模型不含凸组合门控参数（消融MLP头或原型网络），跳过")
+        return None
+    if head.raw_beta.dim() != 1:
+        print("[门控分布分析] 检测到旧版加性残差 checkpoint（raw_beta 为标量，无每类门控），跳过")
+        return None
+    class_counts = class_counts.detach().cpu().float()
+    if class_counts.numel() != head.raw_beta.numel():
+        print(f"[门控分布分析] class_counts 长度({class_counts.numel()})与门控参数({head.raw_beta.numel()})不一致，跳过")
+        return None
+
+    with torch.no_grad():
+        beta = torch.sigmoid(head.raw_beta).detach().cpu().float()          # (C,)
+        tau = (head.tau_min + F.softplus(head.raw_tau)).item()
+        n = class_counts
+        gamma = beta * tau / (n + tau)                                      # (C,)
+        # 无祖先的类（根节点）在模型中强制 γ=0，不参与统计
+        if hasattr(head, 'ancestor_mask'):
+            has_anc = head.ancestor_mask.detach().cpu().any(dim=1)
+        else:
+            has_anc = torch.ones_like(n, dtype=torch.bool)
+    n_excluded = int((~has_anc).sum())
+
+    print("=" * 82)
+    print(f"[门控分布分析] 凸组合门控 γ_i = β_i·τ/(n_i+τ) 的学习结果  ({desc})")
+    print(f"  可学习半饱和常数 τ = {tau:.4f}   (tau_min = {head.tau_min.item():.4f})")
+    print(f"  β_i 统计: mean={beta.mean():.4f}  median={beta.median():.4f}  "
+          f"min={beta.min():.4f}  max={beta.max():.4f}")
+    print(f"  γ_i 统计: mean={gamma.mean():.4f}  median={gamma.median():.4f}  "
+          f"min={gamma.min():.4f}  max={gamma.max():.4f}")
+    if n_excluded > 0:
+        print(f"  （已排除 {n_excluded} 个无祖先类，如根节点）")
+
+    # 2. 按训练正样本数分箱（口径与 eval_count_bucket_comparison 一致）
+    prior = tau / (n + tau)                                                 # β≡1 的构造先验参考线
+    bins = [(0, 0, 'n=0'), (1, 2, '1-2'), (3, 10, '3-10'),
+            (11, 50, '11-50'), (51, float('inf'), '>50')]
+    print("-" * 82)
+    print("  按训练正样本数分箱:  β均值  |  γ均值  |  先验τ/(n+τ)均值  |  类别数")
+    print("-" * 82)
+    for lo, hi, name in bins:
+        m = (n >= lo) & (n <= hi) & has_anc
+        if m.sum() == 0:
+            print(f"  {name:>5} |    -    |    -    |        -        |      0")
+            continue
+        print(f"  {name:>5} |  {beta[m].mean():.4f}  |  {gamma[m].mean():.4f}  |"
+              f"        {prior[m].mean():.4f}        |  {int(m.sum()):>5}")
+    print("-" * 82)
+
+    # 3. Spearman 秩相关：β/γ 与样本量的单调关系
+    pos = has_anc & (n > 0)                                                 # n=0 类无排序意义，剔出相关
+    results = {'tau': tau, 'beta': beta, 'gamma': gamma, 'class_counts': n}
+    if pos.sum() > 2:
+        rho_beta = _spearman(beta[pos].numpy(), n[pos].numpy())
+        rho_gamma = _spearman(gamma[pos].numpy(), n[pos].numpy())
+        results['spearman_beta_n'] = rho_beta
+        results['spearman_gamma_n'] = rho_gamma
+        if rho_beta < -0.1:
+            hint_beta = "负→常见类被主动降低耦合，逐类学习分工"
+        elif rho_beta > 0.1:
+            hint_beta = ("正→β 随样本量略增；若 β 动态范围窄（接近初始值），"
+                         "说明门控梯度主要作用于罕见类，常见类 γ≈0 处近似冻结")
+        else:
+            hint_beta = "≈0→β 未随样本量系统性分化，耦合形状主要由 τ/(n+τ) 先验决定"
+        if rho_gamma < -0.1:
+            hint_gamma = "结构性负相关，由 τ/(n+τ) 设计保证"
+        elif rho_gamma > 0.1:
+            hint_gamma = "正→β 的正相关性压过结构衰减，常见类祖先依赖被抬高（需检查是否过拟合头部类）"
+        else:
+            hint_gamma = "≈0→结构衰减与 β 分化相互抵消"
+        print("  Spearman 秩相关 (仅 n>0 类):")
+        print(f"    β_i vs n_i : {rho_beta:+.4f}   ({hint_beta})")
+        print(f"    γ_i vs n_i : {rho_gamma:+.4f}   ({hint_gamma})")
+    print("=" * 82)
 
     return results
