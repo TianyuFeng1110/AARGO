@@ -1,0 +1,11 @@
+hidden_dim: 1024
+esm_dim: 1280
+warmup_epochs: 2
+base_lr: 1e-3
+
+dataset: TALE
+datasets_path: './data_tale/'
+mode: test                    # [train/test]
+namespace: BP                 # [BP/CC/MF]
+
+zero_shot: True

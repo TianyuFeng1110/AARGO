@@ -1,31 +1,32 @@
-
-
 import torch
-import torch.nn.utils.rnn as rnn_utils
-import numpy as np
-import random
-from Bio import SeqIO
 
 class collator:
-    def __init__(self, go2id, protein_feats):
-        self.go2id = go2id
-        self.protein_feats = protein_feats
-        
+
+    def __init__(self, num_classes, feats):
+        self.num_classes = num_classes
+        self.protein_feats = feats
+
     def __call__(self, data):
-        inputs = torch.stack([self.protein_feats[elem[0]] for elem in data])
+        # data 中每个元素: (idx, seq, label_indices)
+        indices = torch.tensor([elem[0] for elem in data])
+        batch_feats = torch.stack([self.protein_feats[elem[0]] for elem in data], dim=0)
         labels = self._get_labels(data)
 
-        return inputs, labels
+        return batch_feats, labels, indices
 
     def _get_labels(self, data):
-        num_classes = len(self.go2id)
+        """将整数标签索引列表转为 multi-hot 向量。
 
-        # 初始化全 0 tensor
-        multi_hot = torch.zeros((len(data), num_classes))
+        Args:
+            data: list of (idx, mode, seq, label_indices, go_ids)
 
-        for i, (_, index_set) in enumerate(data):
-            if index_set:  # 确保集合不为空
-                # 将 set 转为 list，一次性将该行对应的多个位置设为 1
-                multi_hot[i, [self.go2id[go] for go in index_set if go in self.go2id]] = 1.0
-                
+        Returns:
+            multi_hot: tensor[B, num_classes]，值为 0.0 或 1.0
+        """
+        multi_hot = torch.zeros((len(data), self.num_classes))
+
+        for i, (_, _, label_indices) in enumerate(data):
+            if label_indices:
+                multi_hot[i, label_indices] = 1.0
+
         return multi_hot
